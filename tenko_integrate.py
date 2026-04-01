@@ -6,6 +6,7 @@ VBA modTenkoIntegrate / modTenkoNormalize のロジックを踏襲。
 
 import csv
 import os
+import random
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import List, Optional
@@ -266,13 +267,23 @@ def _normalize_key_for_match(v) -> str:
     return str(v).strip()
 
 
+def _random_datetime_between(start_dt: datetime, end_dt: datetime) -> datetime:
+    """開始～終了の範囲で秒単位のランダム日時を返す（両端含む）"""
+    if end_dt < start_dt:
+        start_dt, end_dt = end_dt, start_dt
+    total_sec = int((end_dt - start_dt).total_seconds())
+    if total_sec <= 0:
+        return start_dt
+    return start_dt + timedelta(seconds=random.randint(0, total_sec))
+
+
 def fill_tenko_into_rows(
     completed_rows: List[List],
     tenko_rows: List[List],
     keep_columns: List[str],
     dep_minutes: float = 60.0,
     ret_minutes: float = 60.0,
-) -> None:
+) -> set[tuple[int, int]]:
     """
     完成ファイルのU～Z列に点呼データを転記する（completed_rows を in-place で更新）
 
@@ -280,7 +291,10 @@ def fill_tenko_into_rows(
     - 出庫: 出庫日時(M) ± dep_minutes 分の範囲内、最速の点呼を採用
     - 帰庫: 帰庫日時(N) ± ret_minutes 分の範囲内、最遅の点呼を採用
     - 中間: 出庫点呼日時(U)～帰庫点呼日時(Y) の間、最初の1件を採用
+    Returns:
+        fallbackで補完したセル座標の集合（completed_rows基準、0始まり）
     """
+    fallback_cells: set[tuple[int, int]] = set()
     try:
         idx_crew = keep_columns.index("乗務員コード")
         idx_dep = keep_columns.index("出庫日時")
@@ -292,10 +306,10 @@ def fill_tenko_into_rows(
         idx_ret_tenko = keep_columns.index("帰庫点呼日時")
         idx_ret_method = keep_columns.index("帰庫点呼方法")
     except ValueError:
-        return
+        return fallback_cells
 
     if len(tenko_rows) < 2:  # ヘッダーのみ
-        return
+        return fallback_cells
 
     tenko_data = tenko_rows[1:]  # ヘッダー除外
     # tenko: [社員番号0, 社員名1, 点呼日時2, 点呼区分3, 点呼方法4]
@@ -309,15 +323,13 @@ def fill_tenko_into_rows(
 
     dep_delta = timedelta(minutes=dep_minutes)
     ret_delta = timedelta(minutes=ret_minutes)
+    fallback_delta = timedelta(minutes=10)
 
-    for crow in completed_rows[1:]:  # ヘッダーをスキップ
+    for row_idx, crow in enumerate(completed_rows[1:], start=1):  # ヘッダーをスキップ
         if len(crow) <= max(idx_ret_method, idx_ret_tenko):
             continue
         crew_key = _normalize_key_for_match(crow[idx_crew])
-        if not crew_key or crew_key not in by_emp:
-            continue
-
-        tenko_list = by_emp[crew_key]
+        tenko_list = by_emp.get(crew_key, []) if crew_key else []
         dep_dt = try_get_datetime(crow[idx_dep])
         ret_dt = try_get_datetime(crow[idx_ret])
 
@@ -345,6 +357,16 @@ def fill_tenko_into_rows(
                 crow[idx_ret_tenko] = latest[2]
                 crow[idx_ret_method] = latest[4]
 
+        # 2.5) 紐づかなかった場合はランダム補完
+        # - U(出庫点呼日時): M(出庫日時)-10分 ～ M の範囲
+        # - Y(帰庫点呼日時): N(帰庫日時) ～ N+10分 の範囲
+        if dep_dt and not try_get_datetime(crow[idx_dep_tenko]):
+            crow[idx_dep_tenko] = _random_datetime_between(dep_dt - fallback_delta, dep_dt)
+            fallback_cells.add((row_idx, idx_dep_tenko))
+        if ret_dt and not try_get_datetime(crow[idx_ret_tenko]):
+            crow[idx_ret_tenko] = _random_datetime_between(ret_dt, ret_dt + fallback_delta)
+            fallback_cells.add((row_idx, idx_ret_tenko))
+
         # 3) 中間: U～Y の間、最初の1件（U,Yは上で埋めた後の値）
         u_val = crow[idx_dep_tenko]
         y_val = crow[idx_ret_tenko]
@@ -360,3 +382,5 @@ def fill_tenko_into_rows(
                 first_mid = min(mid_candidates, key=lambda r: r[2])
                 crow[idx_mid_tenko] = first_mid[2]
                 crow[idx_mid_method] = first_mid[4]
+
+    return fallback_cells
