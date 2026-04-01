@@ -277,6 +277,24 @@ def _random_datetime_between(start_dt: datetime, end_dt: datetime) -> datetime:
     return start_dt + timedelta(seconds=random.randint(0, total_sec))
 
 
+def _to_day_key(v, dep_dt: Optional[datetime], ret_dt: Optional[datetime]) -> str:
+    """
+    同日判定用キーを返す。
+    優先順位:
+      1) 運行日
+      2) 出庫日時(M)
+      3) 帰庫日時(N)
+    """
+    dt = try_get_datetime(v)
+    if dt:
+        return dt.date().isoformat()
+    if dep_dt:
+        return dep_dt.date().isoformat()
+    if ret_dt:
+        return ret_dt.date().isoformat()
+    return ""
+
+
 def fill_tenko_into_rows(
     completed_rows: List[List],
     tenko_rows: List[List],
@@ -297,6 +315,8 @@ def fill_tenko_into_rows(
     fallback_cells: set[tuple[int, int]] = set()
     try:
         idx_crew = keep_columns.index("乗務員コード")
+        idx_name = keep_columns.index("乗務員名")
+        idx_day = keep_columns.index("運行日")
         idx_dep = keep_columns.index("出庫日時")
         idx_ret = keep_columns.index("帰庫日時")
         idx_dep_tenko = keep_columns.index("出庫点呼日時")
@@ -324,14 +344,48 @@ def fill_tenko_into_rows(
     dep_delta = timedelta(minutes=dep_minutes)
     ret_delta = timedelta(minutes=ret_minutes)
     fallback_delta = timedelta(minutes=10)
+    data_rows = completed_rows[1:]
 
-    for row_idx, crow in enumerate(completed_rows[1:], start=1):  # ヘッダーをスキップ
+    # 同運行日(B)・同乗務員名(D)グループの「次行の出庫日時(M)」を事前計算
+    dep_dt_by_row: dict[int, Optional[datetime]] = {}
+    ret_dt_by_row: dict[int, Optional[datetime]] = {}
+    group_key_by_row: dict[int, tuple[str, str]] = {}
+    group_indices: dict[tuple[str, str], list[int]] = defaultdict(list)
+    next_dep_dt_by_row: dict[int, Optional[datetime]] = {}
+
+    for row_idx, crow in enumerate(data_rows, start=1):
+        dep_dt = try_get_datetime(crow[idx_dep]) if len(crow) > idx_dep else None
+        ret_dt = try_get_datetime(crow[idx_ret]) if len(crow) > idx_ret else None
+        dep_dt_by_row[row_idx] = dep_dt
+        ret_dt_by_row[row_idx] = ret_dt
+
+        # 発動条件キー: 同運行日(B)かつ同乗務員名(D)
+        name_key = normalize_display_name(crow[idx_name]) if len(crow) > idx_name else ""
+        day_key = _to_day_key(crow[idx_day] if len(crow) > idx_day else "", dep_dt, ret_dt)
+        gk = (name_key, day_key)
+        group_key_by_row[row_idx] = gk
+        if name_key and day_key:
+            group_indices[gk].append(row_idx)
+
+    for gk, indices in group_indices.items():
+        for i, row_idx in enumerate(indices):
+            if i + 1 < len(indices):
+                next_idx = indices[i + 1]
+                next_dep_dt_by_row[row_idx] = dep_dt_by_row.get(next_idx)
+            else:
+                next_dep_dt_by_row[row_idx] = None
+
+    # 同運行日(B)・同乗務員名(D)で前行の帰庫点呼(Y)を保持し、次行U補完の下限に使う
+    last_ret_tenko_by_group: dict[tuple[str, str], datetime] = {}
+
+    for row_idx, crow in enumerate(data_rows, start=1):  # ヘッダーをスキップ
         if len(crow) <= max(idx_ret_method, idx_ret_tenko):
             continue
         crew_key = _normalize_key_for_match(crow[idx_crew])
         tenko_list = by_emp.get(crew_key, []) if crew_key else []
-        dep_dt = try_get_datetime(crow[idx_dep])
-        ret_dt = try_get_datetime(crow[idx_ret])
+        dep_dt = dep_dt_by_row.get(row_idx)
+        ret_dt = ret_dt_by_row.get(row_idx)
+        gk = group_key_by_row.get(row_idx, ("", ""))
 
         # 1) 出庫: 出庫日時±dep_minutes 分の範囲内、最速
         if dep_dt:
@@ -361,11 +415,32 @@ def fill_tenko_into_rows(
         # - U(出庫点呼日時): M(出庫日時)-10分 ～ M の範囲
         # - Y(帰庫点呼日時): N(帰庫日時) ～ N+10分 の範囲
         if dep_dt and not try_get_datetime(crow[idx_dep_tenko]):
-            crow[idx_dep_tenko] = _random_datetime_between(dep_dt - fallback_delta, dep_dt)
+            start_dt = dep_dt - fallback_delta
+            # 同日・同乗務員の前行Yより前にならないように下限を引き上げる
+            prev_ret_tenko = last_ret_tenko_by_group.get(gk)
+            if prev_ret_tenko and prev_ret_tenko > start_dt:
+                start_dt = prev_ret_tenko
+            end_dt = dep_dt
+            if start_dt > end_dt:
+                start_dt = end_dt
+            crow[idx_dep_tenko] = _random_datetime_between(start_dt, end_dt)
             fallback_cells.add((row_idx, idx_dep_tenko))
         if ret_dt and not try_get_datetime(crow[idx_ret_tenko]):
-            crow[idx_ret_tenko] = _random_datetime_between(ret_dt, ret_dt + fallback_delta)
+            start_dt = ret_dt
+            end_dt = ret_dt + fallback_delta
+            # 同日・同乗務員の次行Mを超えないように上限を抑える
+            next_dep_dt = next_dep_dt_by_row.get(row_idx)
+            if next_dep_dt and next_dep_dt < end_dt:
+                end_dt = next_dep_dt
+            if end_dt < start_dt:
+                end_dt = start_dt
+            crow[idx_ret_tenko] = _random_datetime_between(start_dt, end_dt)
             fallback_cells.add((row_idx, idx_ret_tenko))
+
+        # 現行のY（マッチ/補完後）を次行U補完用に保存
+        ret_tenko_dt = try_get_datetime(crow[idx_ret_tenko])
+        if gk[0] and gk[1] and ret_tenko_dt:
+            last_ret_tenko_by_group[gk] = ret_tenko_dt
 
         # 3) 中間: U～Y の間、最初の1件（U,Yは上で埋めた後の値）
         u_val = crow[idx_dep_tenko]
