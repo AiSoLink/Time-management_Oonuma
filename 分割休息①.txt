@@ -1,0 +1,433 @@
+Option Explicit
+
+'============================================================
+' ① ヘッダー名で「残す列だけキープ」して、それ以外を全削除
+' ② 必要列を所定位置に作る（既存なら移動）
+'    - 休息採用：L(12)固定
+'    - 運行間休息/ランキング：帰庫日時の右へ（出庫/帰庫の並びを崩さない）
+' ③ 以降：運行間休息(分)・ランキング・採用
+' ④ 追加：休息採用にならなかった休息は、休憩へ合算して休息=0
+' ⑤ 追加：各乗務員グループ末尾の「翌月21日以降(21/22/23...)」行は
+'          - 出勤日数にカウントしない
+'          - 休息/休憩の書き換えもしない
+'============================================================
+Public Sub ①分割休息ロジック()
+
+    Dim ws As Worksheet
+    Set ws = ActiveSheet
+
+    Const headerRow As Long = 1
+    Const firstDataRow As Long = headerRow + 1
+
+    Dim prevCalc As XlCalculation
+    prevCalc = Application.Calculation
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+    On Error GoTo CleanUp
+
+    '--------------------------------------------------------
+    ' ① 指定ヘッダーだけ残して、それ以外を削除
+    '--------------------------------------------------------
+    KeepOnlyColumnsByHeaders ws, headerRow
+
+    '--------------------------------------------------------
+    ' ② 必要列を所定位置に作る（既存なら移動）
+    '    休息採用はM固定（運用に合わせて）
+    '    運行間休息/ランキングは帰庫日時の右へ挿入
+    '--------------------------------------------------------
+    EnsureColumnAt ws, "休息採用", 13, headerRow   'M
+
+    Dim colInBase As Long
+    colInBase = FindHeaderCol(ws, "帰庫日時", headerRow)
+    If colInBase = 0 Then Err.Raise vbObjectError + 1000, , "必要なヘッダーが見つかりません（帰庫日時）"
+
+    EnsureColumnAt ws, "運行間休息", colInBase + 1, headerRow
+
+    colInBase = FindHeaderCol(ws, "帰庫日時", headerRow) '挿入でズレるので取り直し
+    EnsureColumnAt ws, "ランキング", colInBase + 2, headerRow
+
+    '--------------------------------------------------------
+    ' ③ ヘッダー名で列番号特定
+    '--------------------------------------------------------
+    Dim colDate As Long:      colDate = FindHeaderCol(ws, "運行日", headerRow)
+    Dim colDriver As Long:    colDriver = FindHeaderCol(ws, "乗務員名", headerRow)
+    Dim colBreak As Long:     colBreak = FindHeaderCol(ws, "休憩", headerRow)
+    Dim colRest As Long:      colRest = FindHeaderCol(ws, "休息", headerRow)
+    Dim colRestAdopt As Long: colRestAdopt = FindHeaderCol(ws, "休息採用", headerRow)
+    Dim colOut As Long:       colOut = FindHeaderCol(ws, "出庫日時", headerRow)
+    Dim colIn As Long:        colIn = FindHeaderCol(ws, "帰庫日時", headerRow)
+    Dim colInter As Long:     colInter = FindHeaderCol(ws, "運行間休息", headerRow)
+    Dim colRank As Long:      colRank = FindHeaderCol(ws, "ランキング", headerRow)
+
+    If colDate = 0 Or colDriver = 0 Or colBreak = 0 Or colRest = 0 Or colRestAdopt = 0 _
+       Or colOut = 0 Or colIn = 0 Or colInter = 0 Or colRank = 0 Then
+        Err.Raise vbObjectError + 1000, , "必要なヘッダーが見つかりません（運行日/乗務員名/休憩/休息/休息採用/出庫日時/帰庫日時/運行間休息/ランキング）"
+    End If
+
+    '--------------------------------------------------------
+    ' ④ 最終行
+    '--------------------------------------------------------
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.rows.Count, colDate).End(xlUp).Row
+    If lastRow < firstDataRow Then GoTo CleanUp
+
+    '--------------------------------------------------------
+    ' ⑤ 出力列クリア & 表示形式
+    '--------------------------------------------------------
+    ws.Range(ws.Cells(firstDataRow, colRestAdopt), ws.Cells(lastRow, colRestAdopt)).ClearContents
+    ws.Range(ws.Cells(firstDataRow, colInter), ws.Cells(lastRow, colInter)).ClearContents
+    ws.Range(ws.Cells(firstDataRow, colRank), ws.Cells(lastRow, colRank)).ClearContents
+
+    ws.Columns(colInter).NumberFormat = "0"
+    ws.Columns(colRank).NumberFormat = "0"
+    ws.Columns(colRestAdopt).NumberFormat = "[h]:mm:ss"
+    ws.Columns(colBreak).NumberFormat = "[h]:mm:ss"
+    ws.Columns(colRest).NumberFormat = "[h]:mm:ss"
+
+    '--------------------------------------------------------
+    ' ⑥ 乗務員ごとに処理
+    '--------------------------------------------------------
+    Dim r As Long
+    r = firstDataRow
+
+    Do While r <= lastRow
+        Dim nameCur As String
+        nameCur = CStr(ws.Cells(r, colDriver).Value)
+
+        Dim gStart As Long: gStart = r
+        Dim gEnd As Long: gEnd = r
+
+        Do While gEnd <= lastRow And CStr(ws.Cells(gEnd, colDriver).Value) = nameCur
+            gEnd = gEnd + 1
+        Loop
+        gEnd = gEnd - 1
+
+        '--- 末尾の「翌月21日以降(21/22/23...)」付け足し行を除外した有効最終行
+        Dim effectiveEnd As Long
+        effectiveEnd = gEnd
+
+        Do While effectiveEnd >= gStart
+            Dim dTmp As Date
+            If Not TryToDate(ws.Cells(effectiveEnd, colDate).Value, dTmp) Then Exit Do
+
+            '末尾の「日が21以上」は付け足し行として除外（21/22/23...全部対象）
+            If Day(DateValue(dTmp)) >= 21 Then
+                effectiveEnd = effectiveEnd - 1
+            Else
+                Exit Do
+            End If
+        Loop
+
+        '--- 出勤日数（付け足し行は含めない）
+        Dim workDays As Long
+        workDays = effectiveEnd - gStart + 1
+        If workDays < 0 Then workDays = 0
+
+        '--- ランキング対象を収集
+        Dim rowsRank() As Long
+        Dim secsRank() As Double
+        Dim cnt As Long: cnt = 0
+
+        Dim i As Long
+        For i = gStart To effectiveEnd
+
+            ' 次行が存在する場合のみ、運行間休息(O)を計算（最終日は空欄OK）
+            Dim interMin As Variant
+            interMin = ""
+
+            If i < gEnd Then
+                Dim dtInCur As Date, dtOutNext As Date
+                Dim okIn As Boolean, okOut As Boolean
+                okIn = TryToDate(ws.Cells(i, colIn).Value, dtInCur)
+                okOut = TryToDate(ws.Cells(i + 1, colOut).Value, dtOutNext)
+
+                If okIn And okOut Then
+                    interMin = DateDiff("n", dtInCur, dtOutNext)
+                    If interMin < 0 Then interMin = ""
+                End If
+            End If
+
+            If IsNumeric(interMin) Then
+                ws.Cells(i, colInter).Value2 = CLng(interMin)
+            Else
+                ws.Cells(i, colInter).ClearContents
+            End If
+
+            '--- ランキング対象判定は「運行間休息が計算できた行」だけ
+            If IsNumeric(interMin) Then
+
+                ' 基準分: 540 + (日付差-1)*1440（運行日の日付差）
+                Dim d1 As Date, d2 As Date
+                Dim dayDiff As Long: dayDiff = 1
+                If TryToDate(ws.Cells(i, colDate).Value, d1) And TryToDate(ws.Cells(i + 1, colDate).Value, d2) Then
+                    dayDiff = CLng(DateValue(d2) - DateValue(d1))
+                    If dayDiff < 1 Then dayDiff = 1
+                End If
+
+                Dim baseline As Long
+                baseline = 540 + (dayDiff - 1) * 1440
+
+                ' 休息(秒)（0:00は除外）
+                Dim restSec As Double
+                restSec = TimeToSeconds(ws.Cells(i, colRest).Value)
+
+                ' ランキング対象: O < baseline かつ 休息>0
+                If CLng(interMin) < baseline Then
+                    If restSec > 0 Then
+                        cnt = cnt + 1
+                        ReDim Preserve rowsRank(1 To cnt)
+                        ReDim Preserve secsRank(1 To cnt)
+                        rowsRank(cnt) = i
+                        secsRank(cnt) = restSec
+                    End If
+                End If
+            End If
+        Next i
+
+        '--- 並べ替え: 休息秒 DESC、同値は行番号 ASC
+        If cnt > 1 Then
+            QuickSortByRestDesc rowsRank, secsRank, 1, cnt
+        End If
+
+        '--- ランキング出力（数値として書く）
+        Dim k As Long
+        For k = 1 To cnt
+            ws.Cells(rowsRank(k), colRank).Value2 = k
+        Next k
+
+        '--- 採用数 = 出勤日数の半分（切り捨て）
+        Dim adoptCount As Long
+        adoptCount = workDays \ 2
+
+        Dim adoptMax As Long
+        adoptMax = adoptCount
+        If adoptMax > cnt Then adoptMax = cnt
+
+        '--- 採用：休息採用へ
+        For k = 1 To adoptMax
+            ws.Cells(rowsRank(k), colRestAdopt).Value = ws.Cells(rowsRank(k), colRest).Value
+        Next k
+
+        '--------------------------------------------------------
+        ' 休息→休憩 合算（付け足し行は絶対に触らない）
+        ' 条件：休息採用が空欄の行（ランキング条件外も含む）
+        '--------------------------------------------------------
+        Dim rr2 As Long
+        For rr2 = gStart To effectiveEnd
+
+            If Len(Trim$(CStr(ws.Cells(rr2, colRestAdopt).Value))) = 0 Then
+                Dim restSecX As Double, breakSecX As Double
+                restSecX = TimeToSeconds(ws.Cells(rr2, colRest).Value)
+
+                If restSecX > 0 Then
+                    breakSecX = TimeToSeconds(ws.Cells(rr2, colBreak).Value)
+
+                    ' 休憩に足す（Excel時刻シリアル = 秒/86400）
+                    ws.Cells(rr2, colBreak).Value2 = (breakSecX + restSecX) / 86400#
+                    ' 休息を0にする
+                    ws.Cells(rr2, colRest).Value2 = 0
+                End If
+            End If
+        Next rr2
+
+        r = gEnd + 1
+    Loop
+
+CleanUp:
+    Application.CutCopyMode = False
+    Application.Calculation = prevCalc
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+End Sub
+
+'============================================================
+' ①「残すヘッダーだけ」キープして、それ以外の列を全削除
+'============================================================
+Private Sub KeepOnlyColumnsByHeaders(ByVal ws As Worksheet, ByVal headerRow As Long)
+    Dim keep As Object
+    Set keep = CreateObject("Scripting.Dictionary")
+    keep.CompareMode = 1 'TextCompare
+
+    keep(NormalizeHeader("運行番号")) = True
+    keep(NormalizeHeader("運行日")) = True
+    keep(NormalizeHeader("乗務員コード")) = True
+    keep(NormalizeHeader("乗務員名")) = True
+    keep(NormalizeHeader("車両コード")) = True
+    keep(NormalizeHeader("車両番号")) = True
+    keep(NormalizeHeader("総走行距離")) = True
+    keep(NormalizeHeader("運転")) = True
+    keep(NormalizeHeader("荷積")) = True
+    keep(NormalizeHeader("荷卸")) = True
+    keep(NormalizeHeader("待機")) = True
+    keep(NormalizeHeader("休憩")) = True
+    keep(NormalizeHeader("休息")) = True
+    keep(NormalizeHeader("出庫日時")) = True
+    keep(NormalizeHeader("帰庫日時")) = True
+
+    Dim lastCol As Long
+    lastCol = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+
+    Dim c As Long
+    For c = lastCol To 1 Step -1
+        Dim h As String
+        h = NormalizeHeader(CStr(ws.Cells(headerRow, c).Value))
+
+        If h = "" Or Not keep.Exists(h) Then
+            ws.Columns(c).Delete
+        End If
+    Next c
+End Sub
+
+Private Function NormalizeHeader(ByVal s As String) As String
+    NormalizeHeader = Trim$(s)
+End Function
+
+'============================================================
+' ヘルパー群
+'============================================================
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerText As String, ByVal headerRow As Long) As Long
+    Dim lastCol As Long
+    lastCol = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+
+    Dim c As Long
+    For c = 1 To lastCol
+        If CStr(ws.Cells(headerRow, c).Value) = headerText Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+    FindHeaderCol = 0
+End Function
+
+Private Sub EnsureColumnAt(ByVal ws As Worksheet, ByVal headerText As String, ByVal targetCol As Long, ByVal headerRow As Long)
+    Dim curCol As Long
+    curCol = FindHeaderCol(ws, headerText, headerRow)
+
+    If curCol = 0 Then
+        ws.Columns(targetCol).Insert Shift:=xlToRight
+        ws.Cells(headerRow, targetCol).Value = headerText
+        Exit Sub
+    End If
+
+    If curCol = targetCol Then Exit Sub
+
+    Dim destCol As Long
+    destCol = targetCol
+    If curCol < targetCol Then destCol = targetCol - 1
+
+    ws.Columns(curCol).Cut
+    ws.Columns(destCol).Insert Shift:=xlToRight
+    Application.CutCopyMode = False
+
+    ws.Cells(headerRow, targetCol).Value = headerText
+End Sub
+
+Private Function TryToDate(ByVal v As Variant, ByRef outDate As Date) As Boolean
+    On Error GoTo Fail
+
+    If IsDate(v) Then
+        outDate = CDate(v)
+        TryToDate = True
+        Exit Function
+    End If
+
+    Dim s As String
+    s = Trim$(CStr(v))
+    If s = "" Then GoTo Fail
+
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+
+    If Not IsDate(s) Then GoTo Fail
+    outDate = CDate(s)
+    TryToDate = True
+    Exit Function
+
+Fail:
+    TryToDate = False
+End Function
+
+Private Function TimeToSeconds(ByVal v As Variant) As Double
+    On Error GoTo Fail
+
+    If IsEmpty(v) Or CStr(v) = "" Then
+        TimeToSeconds = 0
+        Exit Function
+    End If
+
+    If IsNumeric(v) Then
+        TimeToSeconds = CDbl(v) * 86400#
+        If TimeToSeconds < 0.5 Then TimeToSeconds = 0
+        Exit Function
+    End If
+
+    Dim s As String
+    s = Trim$(CStr(v))
+    If s = "" Then
+        TimeToSeconds = 0
+        Exit Function
+    End If
+
+    Dim parts() As String
+    parts = Split(s, ":")
+    If UBound(parts) < 1 Then GoTo Fail
+
+    Dim hh As Double, mm As Double, ss As Double
+    hh = CDbl(parts(0))
+    mm = CDbl(parts(1))
+    ss = 0
+    If UBound(parts) >= 2 Then ss = CDbl(parts(2))
+
+    TimeToSeconds = hh * 3600# + mm * 60# + ss
+    Exit Function
+
+Fail:
+    TimeToSeconds = 0
+End Function
+
+Private Sub QuickSortByRestDesc(ByRef rows() As Long, ByRef secs() As Double, ByVal lo As Long, ByVal hi As Long)
+    Dim i As Long, j As Long
+    i = lo: j = hi
+
+    Dim pSec As Double
+    Dim pRow As Long
+    pSec = secs((lo + hi) \ 2)
+    pRow = rows((lo + hi) \ 2)
+
+    Do While i <= j
+        Do While (secs(i) > pSec) Or (secs(i) = pSec And rows(i) < pRow)
+            i = i + 1
+        Loop
+        Do While (secs(j) < pSec) Or (secs(j) = pSec And rows(j) > pRow)
+            j = j - 1
+        Loop
+
+        If i <= j Then
+            SwapLong rows(i), rows(j)
+            SwapDouble secs(i), secs(j)
+            i = i + 1
+            j = j - 1
+        End If
+    Loop
+
+    If lo < j Then QuickSortByRestDesc rows, secs, lo, j
+    If i < hi Then QuickSortByRestDesc rows, secs, i, hi
+End Sub
+
+Private Sub SwapLong(ByRef a As Long, ByRef b As Long)
+    Dim t As Long
+    t = a: a = b: b = t
+End Sub
+
+Private Sub SwapDouble(ByRef a As Double, ByRef b As Double)
+    Dim t As Double
+    t = a: a = b: b = t
+End Sub
+
+

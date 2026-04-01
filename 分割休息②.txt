@@ -1,0 +1,285 @@
+Option Explicit
+
+Public Sub ②分割休息ロジック()
+
+    Dim wsRun As Worksheet, wsWork As Worksheet
+    Set wsRun = ThisWorkbook.Worksheets("①運行データ貼り付け用")
+    Set wsWork = ThisWorkbook.Worksheets("②作業明細貼り付け用")
+
+    Const headerRow As Long = 1
+    Const firstDataRow As Long = 2
+
+    Dim prevCalc As XlCalculation
+    prevCalc = Application.Calculation
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+    On Error GoTo CleanUp
+
+    '--- 列特定（ヘッダー名で探す）
+    Dim run_colNo As Long: run_colNo = FindHeaderCol(wsRun, "運行番号", headerRow)
+    Dim run_colAdopt As Long: run_colAdopt = FindHeaderCol(wsRun, "休息採用", headerRow)
+    Dim run_colOut As Long: run_colOut = FindHeaderCol(wsRun, "出庫日時", headerRow)
+
+    Dim work_colNo As Long: work_colNo = FindHeaderCol(wsWork, "運行番号", headerRow)
+    Dim work_colDate As Long: work_colDate = FindHeaderCol(wsWork, "運行日", headerRow)
+    Dim work_colArr As Long: work_colArr = FindHeaderCol(wsWork, "到着時刻", headerRow)
+    Dim work_colDep As Long: work_colDep = FindHeaderCol(wsWork, "出発時刻", headerRow)
+
+    If run_colNo = 0 Or run_colAdopt = 0 Or run_colOut = 0 Then
+        Err.Raise vbObjectError + 3000, , "①シートで必要ヘッダーが見つかりません（運行番号/休息採用/出庫日時）"
+    End If
+    If work_colNo = 0 Or work_colDate = 0 Or work_colArr = 0 Or work_colDep = 0 Then
+        Err.Raise vbObjectError + 3001, , "②シートで必要ヘッダーが見つかりません（運行番号/運行日/到着時刻/出発時刻）"
+    End If
+
+    '--- ①の出力先（S～V）
+    wsRun.Cells(headerRow, 19).Value = "分割開始1" 'S
+    wsRun.Cells(headerRow, 20).Value = "分割終了1" 'T
+    wsRun.Cells(headerRow, 21).Value = "分割開始2" 'U
+    wsRun.Cells(headerRow, 22).Value = "分割終了2" 'V
+
+    wsRun.Columns(19).NumberFormat = "yyyy/m/d h:mm"
+    wsRun.Columns(20).NumberFormat = "yyyy/m/d h:mm"
+    wsRun.Columns(21).NumberFormat = "yyyy/m/d h:mm"
+    wsRun.Columns(22).NumberFormat = "yyyy/m/d h:mm"
+
+    '==================================================
+    ' ② → 辞書作成
+    '==================================================
+    Dim dict As Object
+    Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = 1 'TextCompare
+
+    Dim lastRowWork As Long
+    lastRowWork = wsWork.Cells(wsWork.rows.Count, work_colNo).End(xlUp).Row
+    If lastRowWork < firstDataRow Then GoTo CleanUp
+
+    Dim r As Long
+    For r = firstDataRow To lastRowWork
+
+        Dim key As String
+        key = NormalizeRunNo(wsWork.Cells(r, work_colNo).Value2)
+        If key = "" Then GoTo ContinueWork
+
+        Dim d As Date, tArr As Date, tDep As Date
+        Dim okD As Boolean, okArr As Boolean, okDep As Boolean
+
+        okD = GetDateFromCell(wsWork.Cells(r, work_colDate), d)
+        okArr = GetTimeFromCell(wsWork.Cells(r, work_colArr), tArr)
+        okDep = GetTimeFromCell(wsWork.Cells(r, work_colDep), tDep)
+
+        If Not okD Then GoTo ContinueWork
+        If (Not okArr) And (Not okDep) Then GoTo ContinueWork
+
+        Dim baseDate As Date
+        baseDate = DateSerial(Year(d), Month(d), Day(d))
+
+        Dim arrDT As Variant, depDT As Variant
+        arrDT = Empty: depDT = Empty
+
+        '秒は切り捨て（0秒にする）
+        If okArr Then arrDT = baseDate + TimeSerial(Hour(tArr), Minute(tArr), 0)
+        If okDep Then depDT = baseDate + TimeSerial(Hour(tDep), Minute(tDep), 0)
+
+        '==================================================
+        ' 日跨ぎ補正①：到着が出発より後なら、出発日時を+1日（翌日扱い）
+        '==================================================
+        If okArr And okDep Then
+            If Not IsEmpty(arrDT) And Not IsEmpty(depDT) Then
+                If CDate(arrDT) > CDate(depDT) Then
+                    depDT = DateAdd("d", 1, CDate(depDT))
+                End If
+            End If
+        End If
+
+        Dim rec As Variant
+        If Not dict.Exists(key) Then
+            rec = Array(Empty, Empty, Empty, Empty, 0&)
+        Else
+            rec = dict(key)
+        End If
+
+        Dim cnt As Long
+        cnt = CLng(rec(4))
+
+        If cnt = 0 Then
+            rec(0) = arrDT
+            rec(1) = depDT
+            rec(4) = 1
+            dict(key) = rec
+        ElseIf cnt = 1 Then
+            rec(2) = arrDT
+            rec(3) = depDT
+            rec(4) = 2
+            dict(key) = rec
+        Else
+            '3回目以降は無視
+        End If
+
+ContinueWork:
+    Next r
+
+    '==================================================
+    ' ① → 転記（休息採用あり行だけ）
+    '==================================================
+    Dim lastRowRun As Long
+    lastRowRun = wsRun.Cells(wsRun.rows.Count, run_colNo).End(xlUp).Row
+    If lastRowRun < firstDataRow Then GoTo CleanUp
+
+    For r = firstDataRow To lastRowRun
+
+        If Len(Trim$(CStr(wsRun.Cells(r, run_colAdopt).Value))) = 0 Then GoTo ContinueRun
+
+        Dim keyRun As String
+        keyRun = NormalizeRunNo(wsRun.Cells(r, run_colNo).Value2)
+        If keyRun = "" Then GoTo ContinueRun
+
+        wsRun.Cells(r, 19).ClearContents
+        wsRun.Cells(r, 20).ClearContents
+        wsRun.Cells(r, 21).ClearContents
+        wsRun.Cells(r, 22).ClearContents
+
+        If dict.Exists(keyRun) Then
+            Dim rec2 As Variant
+            rec2 = dict(keyRun)
+
+            If Not IsEmpty(rec2(0)) Then wsRun.Cells(r, 19).Value2 = rec2(0)
+            If Not IsEmpty(rec2(1)) Then wsRun.Cells(r, 20).Value2 = rec2(1)
+            If Not IsEmpty(rec2(2)) Then wsRun.Cells(r, 21).Value2 = rec2(2)
+            If Not IsEmpty(rec2(3)) Then wsRun.Cells(r, 22).Value2 = rec2(3)
+
+            '==================================================
+            ' 分割開始が出庫日時より前なら、(開始/終了) を+1日
+            '   - 分割開始1(S) < 出庫日時 なら S/T を +1日
+            '   - 分割開始2(U) < 出庫日時 なら U/V を +1日
+            '==================================================
+            Dim dtOut As Date
+            If GetDateTimeFromCell(wsRun.Cells(r, run_colOut), dtOut) Then
+
+                '開始1
+                If IsDate(wsRun.Cells(r, 19).Value) Then
+                    If CDate(wsRun.Cells(r, 19).Value) < dtOut Then
+                        wsRun.Cells(r, 19).Value2 = DateAdd("d", 1, CDate(wsRun.Cells(r, 19).Value))
+                        If IsDate(wsRun.Cells(r, 20).Value) Then
+                            wsRun.Cells(r, 20).Value2 = DateAdd("d", 1, CDate(wsRun.Cells(r, 20).Value))
+                        End If
+                    End If
+                End If
+
+                '開始2
+                If IsDate(wsRun.Cells(r, 21).Value) Then
+                    If CDate(wsRun.Cells(r, 21).Value) < dtOut Then
+                        wsRun.Cells(r, 21).Value2 = DateAdd("d", 1, CDate(wsRun.Cells(r, 21).Value))
+                        If IsDate(wsRun.Cells(r, 22).Value) Then
+                            wsRun.Cells(r, 22).Value2 = DateAdd("d", 1, CDate(wsRun.Cells(r, 22).Value))
+                        End If
+                    End If
+                End If
+
+            End If
+        End If
+
+ContinueRun:
+    Next r
+
+CleanUp:
+    Application.CutCopyMode = False
+    Application.Calculation = prevCalc
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+End Sub
+
+'============================================================
+' ヘルパー
+'============================================================
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerText As String, ByVal headerRow As Long) As Long
+    Dim lastCol As Long
+    lastCol = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim c As Long
+    For c = 1 To lastCol
+        If CStr(ws.Cells(headerRow, c).Value) = headerText Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+    FindHeaderCol = 0
+End Function
+
+Private Function NormalizeRunNo(ByVal v As Variant) As String
+    If IsEmpty(v) Or v = "" Then
+        NormalizeRunNo = ""
+        Exit Function
+    End If
+    If IsNumeric(v) Then
+        NormalizeRunNo = Trim$(Format$(CDbl(v), "0"))
+    Else
+        NormalizeRunNo = Trim$(CStr(v))
+    End If
+End Function
+
+Private Function GetDateFromCell(ByVal cell As Range, ByRef outDate As Date) As Boolean
+    On Error GoTo Fail
+    Dim v As Variant: v = cell.Value2
+
+    If IsNumeric(v) Then
+        outDate = DateSerial(1899, 12, 30) + CDbl(v)
+        GetDateFromCell = True
+        Exit Function
+    End If
+
+    If IsDate(cell.Value) Then
+        outDate = CDate(cell.Value)
+        GetDateFromCell = True
+        Exit Function
+    End If
+Fail:
+    GetDateFromCell = False
+End Function
+
+Private Function GetTimeFromCell(ByVal cell As Range, ByRef outTime As Date) As Boolean
+    On Error GoTo Fail
+    Dim v As Variant: v = cell.Value2
+
+    If IsNumeric(v) Then
+        Dim frac As Double
+        frac = CDbl(v) - Fix(CDbl(v))
+        If frac < 0 Then frac = frac + 1
+        outTime = TimeSerial(0, 0, 0) + frac
+        GetTimeFromCell = True
+        Exit Function
+    End If
+
+    If IsDate(cell.Value) Then
+        outTime = TimeValue(CDate(cell.Value))
+        GetTimeFromCell = True
+        Exit Function
+    End If
+Fail:
+    GetTimeFromCell = False
+End Function
+
+'★出庫日時など「日付＋時刻」用（Value2が数値ならそのままDate化）
+Private Function GetDateTimeFromCell(ByVal cell As Range, ByRef outDT As Date) As Boolean
+    On Error GoTo Fail
+    Dim v As Variant: v = cell.Value2
+
+    If IsNumeric(v) Then
+        outDT = DateSerial(1899, 12, 30) + CDbl(v)
+        GetDateTimeFromCell = True
+        Exit Function
+    End If
+
+    If IsDate(cell.Value) Then
+        outDT = CDate(cell.Value)
+        GetDateTimeFromCell = True
+        Exit Function
+    End If
+
+Fail:
+    GetDateTimeFromCell = False
+End Function
+

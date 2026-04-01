@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+build/
+dist/
+*.spec
+*.exe
+*.pyc
+.DS_Store
+
+# Runtime/output folders
+ゴミ箱/
+完成フォルダ/
+ここにファイルを入れてください/
+
+# Local config
+tenko_settings.json
