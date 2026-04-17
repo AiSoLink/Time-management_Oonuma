@@ -495,9 +495,21 @@ class App(tk.Tk):
 
         top_m = tk.Frame(self.frame_monthly)
         top_m.pack(fill="x", padx=10, pady=10)
-        tk.Button(top_m, text="⚙ 設定", command=self.open_tenko_settings, width=8, height=2).pack(side="right", padx=(8, 15))
-        tk.Button(top_m, text="毎日ファイル", command=self.add_monthly_files, width=20, height=2).pack(side="left", padx=4)
-        tk.Button(top_m, text="SGシステム作業明細", command=self.add_work_detail_files, width=20, height=2).pack(side="left", padx=4)
+        btn_row_m = tk.Frame(top_m)
+        btn_row_m.pack(fill="x")
+        btn_left_m = tk.Frame(btn_row_m)
+        btn_left_m.pack(side="left", fill="both", expand=True)
+        btn_left_m.grid_columnconfigure(0, weight=1, uniform="monthly_pick_btns")
+        btn_left_m.grid_columnconfigure(1, weight=1, uniform="monthly_pick_btns")
+        tk.Button(btn_left_m, text="毎日ファイル", command=self.add_monthly_files, height=2).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4)
+        )
+        tk.Button(btn_left_m, text="SGシステム作業明細", command=self.add_work_detail_files, height=2).grid(
+            row=0, column=1, sticky="ew", padx=(4, 0)
+        )
+        right_top_m = tk.Frame(btn_row_m)
+        right_top_m.pack(side="left", fill="y", padx=10)
+        tk.Button(right_top_m, text="⚙ 設定", command=self.open_tenko_settings, width=8, height=2).pack()
 
         mid_m = tk.Frame(self.frame_monthly)
         mid_m.pack(fill="both", expand=True, padx=10)
