@@ -447,20 +447,34 @@ class App(tk.Tk):
 
         left_d = tk.Frame(mid)
         left_d.pack(side="left", fill="both", expand=True)
+        left_d.grid_columnconfigure(0, weight=1)
+        left_d.grid_rowconfigure(1, weight=1)
+        left_d.grid_rowconfigure(3, weight=1)
+        left_d.grid_rowconfigure(5, weight=1)
 
-        tk.Label(left_d, text="運行データ").pack(anchor="w")
+        tk.Label(left_d, text="運行データ").grid(row=0, column=0, sticky="w")
         list_frame_d = tk.Frame(left_d)
-        list_frame_d.pack(fill="both", expand=True)
-        self.listbox = tk.Listbox(list_frame_d, selectmode=tk.EXTENDED, height=10)
-        self.listbox.pack(side="left", fill="both", expand=True)
+        list_frame_d.grid(row=1, column=0, sticky="nsew")
+        list_frame_d.grid_rowconfigure(0, weight=1)
+        list_frame_d.grid_columnconfigure(0, weight=1)
+        self.listbox = tk.Listbox(list_frame_d, selectmode=tk.EXTENDED)
+        self.listbox.grid(row=0, column=0, sticky="nsew")
 
-        tk.Label(left_d, text="対面アルキラー").pack(anchor="w", pady=(8, 0))
-        self.listbox_face = tk.Listbox(left_d, selectmode=tk.EXTENDED, height=1)
-        self.listbox_face.pack(anchor="w", fill="x")
+        tk.Label(left_d, text="対面アルキラー").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        face_frame = tk.Frame(left_d)
+        face_frame.grid(row=3, column=0, sticky="nsew")
+        face_frame.grid_rowconfigure(0, weight=1)
+        face_frame.grid_columnconfigure(0, weight=1)
+        self.listbox_face = tk.Listbox(face_frame, selectmode=tk.EXTENDED)
+        self.listbox_face.grid(row=0, column=0, sticky="nsew")
 
-        tk.Label(left_d, text="遠隔アルキラー").pack(anchor="w", pady=(6, 0))
-        self.listbox_remote = tk.Listbox(left_d, selectmode=tk.EXTENDED, height=1)
-        self.listbox_remote.pack(anchor="w", fill="x")
+        tk.Label(left_d, text="遠隔アルキラー").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        remote_frame = tk.Frame(left_d)
+        remote_frame.grid(row=5, column=0, sticky="nsew")
+        remote_frame.grid_rowconfigure(0, weight=1)
+        remote_frame.grid_columnconfigure(0, weight=1)
+        self.listbox_remote = tk.Listbox(remote_frame, selectmode=tk.EXTENDED)
+        self.listbox_remote.grid(row=0, column=0, sticky="nsew")
 
         # 右側：上下矢印・削除・すべて削除（上から下へ、下寄せ）
         right = tk.Frame(mid)
@@ -524,7 +538,7 @@ class App(tk.Tk):
 
         # 画面中央（横）× 中央と最上の中間（縦）に配置
         self.update_idletasks()
-        w, h = 720, 420
+        w, h = 720, 560
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 4)  # 最上と中央の中間（1/4位置）
