@@ -388,6 +388,37 @@ def _fill_eda_num_from_vehicle_code(rows, keep_columns):
             pass  # 数値に変換できない場合はスキップ
 
 
+def _ensure_monthly_untin_column(rows):
+    """
+    月末出力行に「運転」列を必ず持たせる。
+    - 既存なら値を表示用に整形
+    - 未存在なら「帰庫点呼方法」の次（AA想定）に挿入
+    """
+    if not rows:
+        return
+
+    header = rows[0]
+    if not header:
+        return
+
+    if "運転" in header:
+        idx_untin = header.index("運転")
+    else:
+        insert_at = len(header)
+        if "帰庫点呼方法" in header:
+            insert_at = header.index("帰庫点呼方法") + 1
+
+        header.insert(insert_at, "運転")
+        for row in rows[1:]:
+            row.insert(insert_at, "")
+        idx_untin = insert_at
+
+    for row in rows[1:]:
+        while len(row) <= idx_untin:
+            row.append("")
+        row[idx_untin] = _format_untin_display(row[idx_untin])
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -828,6 +859,7 @@ class App(tk.Tk):
 
             # ③ 分割休息①→②を実行
             final_rows = run_split_rest(all_rows, work_detail_path)
+            _ensure_monthly_untin_column(final_rows)
 
             if temp_work_detail and os.path.isfile(temp_work_detail):
                 try:
