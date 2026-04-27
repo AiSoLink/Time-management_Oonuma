@@ -419,6 +419,154 @@ def _ensure_monthly_untin_column(rows):
         row[idx_untin] = _format_untin_display(row[idx_untin])
 
 
+def _to_datetime_flexible(value):
+    """
+    値を datetime に変換する（変換不能なら None）。
+    - datetime/date
+    - Excelシリアル日付
+    - 文字列（複数フォーマット）
+    """
+    from datetime import datetime, date, time, timedelta
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime.combine(value, time.min)
+    if isinstance(value, (int, float)):
+        try:
+            n = float(value)
+            if n > 0:
+                return datetime(1899, 12, 30) + timedelta(days=n)
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        for fmt in (
+            "%Y/%m/%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M",
+            "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+            "%Y/%m/%d", "%Y-%m-%d",
+        ):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def _has_value(v):
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return v.strip() != ""
+    return True
+
+
+def _overlap_seconds(start_dt, end_dt, window_start, window_end):
+    from datetime import timedelta
+    start = max(start_dt, window_start)
+    end = min(end_dt, window_end)
+    if end <= start:
+        return 0.0
+    return max(0.0, (end - start) / timedelta(seconds=1))
+
+
+def _night_overlap_seconds(start_dt, end_dt):
+    """
+    区間 [start_dt, end_dt) と法定深夜帯（22:00-翌5:00）の重複秒数を返す。
+    """
+    from datetime import datetime, time, timedelta
+
+    if start_dt is None or end_dt is None or end_dt <= start_dt:
+        return 0.0
+
+    total = 0.0
+    day = start_dt.date() - timedelta(days=1)
+    end_day = end_dt.date()
+
+    while day <= end_day:
+        night_start = datetime.combine(day, time(22, 0, 0))
+        night_end = night_start + timedelta(hours=7)
+        total += _overlap_seconds(start_dt, end_dt, night_start, night_end)
+        day += timedelta(days=1)
+
+    return total
+
+
+def _ensure_monthly_houtei_shinya_column(rows):
+    """
+    月末出力行に「法定深夜」列（AB）を追加し、値を計算する。
+    仕様:
+    - ベース: 出庫日時(M)〜帰庫日時(N) の法定深夜重複
+    - 控除: 休息採用がある行のみ、分割1(Q-R)・分割2(S-T) の法定深夜重複
+    - 休憩は控除しない
+    - 出力値: Excelシリアル時刻（[h]:mm:ss表示想定）
+    """
+    if not rows:
+        return
+
+    header = rows[0]
+    if not header:
+        return
+
+    # ABは運転（AA）の次を基本位置にする
+    if "法定深夜" in header:
+        idx_houtei = header.index("法定深夜")
+    else:
+        insert_at = len(header)
+        if "運転" in header:
+            insert_at = header.index("運転") + 1
+        elif "帰庫点呼方法" in header:
+            insert_at = header.index("帰庫点呼方法") + 1
+        header.insert(insert_at, "法定深夜")
+        for row in rows[1:]:
+            row.insert(insert_at, "")
+        idx_houtei = insert_at
+
+    def idx_of(name):
+        try:
+            return header.index(name)
+        except ValueError:
+            return -1
+
+    idx_dep = idx_of("出庫日時")
+    idx_ret = idx_of("帰庫日時")
+    idx_adopt = idx_of("休息採用")
+    idx_s1 = idx_of("分割開始1")
+    idx_e1 = idx_of("分割終了1")
+    idx_s2 = idx_of("分割開始2")
+    idx_e2 = idx_of("分割終了2")
+
+    for row in rows[1:]:
+        while len(row) <= idx_houtei:
+            row.append("")
+
+        # ベース深夜時間（M-N）
+        dep_dt = _to_datetime_flexible(row[idx_dep] if 0 <= idx_dep < len(row) else None)
+        ret_dt = _to_datetime_flexible(row[idx_ret] if 0 <= idx_ret < len(row) else None)
+        base_night_sec = _night_overlap_seconds(dep_dt, ret_dt)
+
+        # 控除（休息採用あり行のみ。分割は開始/終了セットが揃っているものだけ）
+        deduct_sec = 0.0
+        adopt_val = row[idx_adopt] if 0 <= idx_adopt < len(row) else None
+        if _has_value(adopt_val):
+            for idx_start, idx_end in ((idx_s1, idx_e1), (idx_s2, idx_e2)):
+                if idx_start < 0 or idx_end < 0:
+                    continue
+                s_dt = _to_datetime_flexible(row[idx_start] if idx_start < len(row) else None)
+                e_dt = _to_datetime_flexible(row[idx_end] if idx_end < len(row) else None)
+                # 1セットで扱う: 開始/終了が揃い、かつ終了>開始のみ有効
+                if s_dt is None or e_dt is None or e_dt <= s_dt:
+                    continue
+                deduct_sec += _night_overlap_seconds(s_dt, e_dt)
+
+        net_sec = max(0.0, base_night_sec - deduct_sec)
+        row[idx_houtei] = net_sec / 86400.0  # Excelシリアル時刻
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -860,6 +1008,7 @@ class App(tk.Tk):
             # ③ 分割休息①→②を実行
             final_rows = run_split_rest(all_rows, work_detail_path)
             _ensure_monthly_untin_column(final_rows)
+            _ensure_monthly_houtei_shinya_column(final_rows)
 
             if temp_work_detail and os.path.isfile(temp_work_detail):
                 try:
@@ -896,6 +1045,15 @@ class App(tk.Tk):
                 for c in ws_out.iter_cols(min_col=col, max_col=col, min_row=2):
                     for cell in c:
                         cell.number_format = time_fmt
+
+            # 法定深夜列（AB）は [h]:mm:ss
+            try:
+                idx_houtei = final_rows[0].index("法定深夜") + 1  # 1-based
+                for c in ws_out.iter_cols(min_col=idx_houtei, max_col=idx_houtei, min_row=2):
+                    for cell in c:
+                        cell.number_format = time_fmt
+            except (ValueError, IndexError, TypeError):
+                pass
 
             yu_gothic_font = Font(name="游ゴシック")
             for row in ws_out.iter_rows():
